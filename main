@@ -1,0 +1,448 @@
+import asyncio
+import os
+import random
+import sqlite3
+import logging
+from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import InlineKeyboardButton, Message
+from aiogram.enums import ParseMode
+
+# --- НАСТРОЙКИ ---
+BOT_TOKEN = os.getenv("BOT_TOKEN") # Берет токен из переменной окружения
+ADMIN_ID = 123456789 # ВАШ TELEGRAM ID (узнать можно у @userinfobot)
+DB_NAME = "game_bot.db"
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# --- БАЗА ДАННЫХ ---
+def init_db():
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        # Пользователи
+        cursor.execute("""CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, 
+            gold INTEGER DEFAULT 0, last_daily TEXT
+        )""")
+        # Чаты
+        cursor.execute("""CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY)""")
+        # Активные голосования (Обвинения)
+        cursor.execute("""CREATE TABLE IF NOT EXISTS accusations (
+            msg_id INTEGER PRIMARY KEY, chat_id INTEGER, accuser_id INTEGER, 
+            target_id INTEGER, text TEXT, end_time TIMESTAMP, votes_yes INTEGER DEFAULT 0, votes_no INTEGER DEFAULT 0
+        )""")
+        # Аналитика (Действия)
+        cursor.execute("""CREATE TABLE IF NOT EXISTS analytics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, action_type TEXT
+        )""")
+        # Клоун дня
+        cursor.execute("""CREATE TABLE IF NOT EXISTS clown_of_day (
+            chat_id INTEGER PRIMARY KEY, user_id INTEGER, date TEXT
+        )""")
+        conn.commit()
+
+init_db()
+
+# --- ХЕЛПЕРЫ ---
+def get_user(user_id):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        return cursor.fetchone()
+
+def register_user(user_id, username, first_name):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)", (user_id, username, first_name))
+        conn.commit()
+
+def add_analytics(action_type):
+    today = datetime.now().strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO analytics (date, action_type) VALUES (?, ?)", (today, action_type))
+        conn.commit()
+
+# --- СПИСКИ ДЛЯ РАНДОМА ---
+NATIONALITIES = [
+    "Русский", "Казах", "Татарин", "Чеченец", "Украинец", "Белорус", "Узбек", 
+    "Армянин", "Грузин", "Еврей", "Китаец", "Японец", "Марсианин", "Эльф", 
+    "Гном", "Пират", "Самурай", "Ковбой", "Викинг", "Инопланетянин", "Дед Мороз"
+]
+ACCUSATION_TEMPLATES = [
+    "{} кушал каки {}",
+    "{} невероятно возбудился от {}",
+    "{} украл трусы {}",
+    "{} признался в любви {}",
+    "{} подглядывал за {} в душе",
+    "{} пукнул в сторону {}",
+    "{} тайно влюблен в {}",
+    "{} съел последнюю печеньку {}",
+    "{} назвал {} лохом",
+    "{} продал душу дьяволу ради внимания {}",
+    "{} вчера ночью плакал из-за {}",
+    "{} тайно пишет стихи про {}"
+]
+POO_TEMPLATES = [
+    "{} кинул какашку в {}! Прямое попадание в лицо! 💩",
+    "{} запустил снаряд из какашек в {}! 💩🚀",
+    "{} незаметно подложил какашку в карман {} 💩",
+    "{} обмазал {} с ног до головы какашками! 💩"
+]
+WORDS_OF_DAY = [
+    "Кринж", "Базед", "Скибиди", "Вайб", "Ауф", "Рофл", 
+    "Шейминг", "Краш", "Слэй", "Чилл", "Буллинг", "Гоуст"
+]
+CLOWN_TEMPLATES = [
+    "🤡 **Клоун дня** в этом чате — {}. Причина: пытался доказать, что земля плоская.",
+    "🤡 **Клоун дня** — {}. Причина: написал бывшей в 3 часа ночи.",
+    "🤡 **Клоун дня** — {}. Причина: зашел в чат и сразу вышел.",
+    "🤡 **Клоун дня** — {}. Причина: поспорил с ботом.",
+    "🤡 **Клоун дня** — {}. Причина: съел шаурму с майонезом.",
+    "🤡 **Клоун дня** — {}. Причина: забыл, зачем открыл телеграм."
+]
+DAILY_GOLD = 100
+
+# --- КОМАНДЫ ИГРЫ ---
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    register_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("INSERT OR IGNORE INTO chats (chat_id) VALUES (?)", (message.chat.id,))
+        conn.commit()
+    add_analytics("start")
+    await message.answer(f"Привет, {message.from_user.first_name}! Я игровой бот. Используй /help для списка команд.")
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    text = ("🎮 **Доступные команды:**\n\n"
+            "💰 `/daily` — получить ежедневную голду\n"
+            "🏆 `/stats` — статистика по голде в чате\n"
+            "🌍 `/nation` — узнать свою национальность (рандом)\n"
+            "💩 `/poo` (в ответ на сообщение) — кинуть какашку\n"
+            "📰 `/word` — слово дня\n"
+            "⚖️ `/accuse` (в ответ на сообщение) — обвинить пользователя\n"
+            "🤡 `/kloun` — выбрать клоуна дня\n"
+            "👑 `/admin` — панель администратора")
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+
+@dp.message(Command("daily"))
+async def cmd_daily(message: Message):
+    user = get_user(message.from_user.id)
+    if not user:
+        register_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+        user = get_user(message.from_user.id)
+    
+    last_daily = user[4]
+    now = datetime.now()
+    
+    if last_daily:
+        last_date = datetime.strptime(last_daily, "%Y-%m-%d")
+        if (now - last_date).days < 1:
+            await message.reply("❌ Ты уже забирал голду сегодня. Приходи завтра!")
+            return
+
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET gold = gold + ?, last_daily = ? WHERE user_id = ?", 
+                       (DAILY_GOLD, now.strftime("%Y-%m-%d"), message.from_user.id))
+        conn.commit()
+    add_analytics("daily")
+    await message.reply(f"✅ Ты получил {DAILY_GOLD} голды! Приходи завтра еще.")
+
+@dp.message(Command("nation"))
+async def cmd_nation(message: Message):
+    # Каждый раз выпадает рандомно
+    nation = random.choice(NATIONALITIES)
+    add_analytics("nation")
+    await message.reply(f"🌍 Анализ ДНК завершен! Твоя национальность: **{nation}**\n(Результат может измениться в следующий раз)")
+
+@dp.message(Command("word"))
+async def cmd_word(message: Message):
+    word = random.choice(WORDS_OF_DAY)
+    await message.reply(f"📰 **Слово дня:** {word}\nИспользуй его сегодня в чате, чтобы быть в тренде!")
+
+@dp.message(Command("kloun"))
+async def cmd_kloun(message: Message):
+    today = datetime.now().strftime("%Y-%m-%d")
+    
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, date FROM clown_of_day WHERE chat_id = ?", (message.chat.id,))
+        res = cursor.fetchone()
+        
+        if res and res[1] == today:
+            # Если клоун уже выбран сегодня
+            cursor.execute("SELECT first_name FROM users WHERE user_id = ?", (res[0],))
+            user_name = cursor.fetchone()[0]
+            await message.reply(f"🤡 Сегодняшний **Клоун дня** уже выбран! Это {user_name}. Ждите завтра.")
+            return
+
+        # Выбираем случайного участника из тех, кто писал (или просто рандомного из БД)
+        cursor.execute("SELECT user_id, first_name FROM users ORDER BY RANDOM() LIMIT 1")
+        clown = cursor.fetchone()
+        
+        if not clown:
+            await message.reply("В базе пока нет пользователей. Пусть кто-нибудь напишет /start.")
+            return
+
+    clown_id, clown_name = clown
+    template = random.choice(CLOWN_TEMPLATES)
+    text = template.format(f"[{clown_name}](tg://user?id={clown_id})")
+    
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("INSERT OR REPLACE INTO clown_of_day (chat_id, user_id, date) VALUES (?, ?, ?)", 
+                     (message.chat.id, clown_id, today))
+        conn.commit()
+        
+    add_analytics("kloun")
+    await message.reply(text, parse_mode=ParseMode.MARKDOWN)
+
+@dp.message(Command("poo"))
+async def cmd_poo(message: Message):
+    if not message.reply_to_message:
+        await message.reply("Кинь какашку кому-то! Для этого ответь на сообщение жертвы командой /poo")
+        return
+    
+    target = message.reply_to_message.from_user
+    sender = message.from_user
+    
+    if target.id == sender.id:
+        await message.reply("Нельзя кидать какашки в самого себя! 🤢")
+        return
+
+    text = random.choice(POO_TEMPLATES).format(f"[{sender.first_name}](tg://user?id={sender.id})", f"[{target.first_name}](tg://user?id={target.id})")
+    add_analytics("poo")
+    await message.reply(text, parse_mode=ParseMode.MARKDOWN)
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT first_name, gold FROM users ORDER BY gold DESC LIMIT 10")
+        top_users = cursor.fetchall()
+        
+    if not top_users:
+        await message.reply("Пока нет статистики.")
+        return
+
+    text = "🏆 **Топ-10 богачей (Голда):**\n\n"
+    for i, (name, gold) in enumerate(top_users, 1):
+        text += f"{i}. {name}: {gold} 💰\n"
+    add_analytics("stats")
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+
+# --- МЕХАНИКА ОБВИНЕНИЙ ---
+
+@dp.message(Command("accuse"))
+async def cmd_accuse(message: Message):
+    if not message.reply_to_message:
+        await message.reply("Чтобы обвинить кого-то, ответь на его сообщение командой /accuse")
+        return
+
+    target = message.reply_to_message.from_user
+    accuser = message.from_user
+    
+    if target.id == accuser.id:
+        await message.reply("Шизофрения? Обвинять самого себя это кринж.")
+        return
+    if target.is_bot:
+        await message.reply("Ботов обвинять нельзя, они и так ИИ.")
+        return
+
+    template = random.choice(ACCUSATION_TEMPLATES)
+    accusation_text = template.format(f"[{accuser.first_name}](tg://user?id={accuser.id})", f"[{target.first_name}](tg://user?id={target.id})")
+    
+    # Клавиатура голосования
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="✅ Да (0)", callback_data=f"vote_yes_{message.from_user.id}"),
+        InlineKeyboardButton(text="❌ Нет (0)", callback_data=f"vote_no_{message.from_user.id}")
+    )
+    
+    end_time = datetime.now() + timedelta(minutes=1)
+    msg = await message.reply(f"⚖️ **ОБВИНЕНИЕ!**\n\n{accusation_text}\n\nГолосуйте! (1 минута)", 
+                              reply_markup=builder.as_markup(), parse_mode=ParseMode.MARKDOWN)
+    
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("INSERT INTO accusations (msg_id, chat_id, accuser_id, target_id, text, end_time) VALUES (?, ?, ?, ?, ?, ?)",
+                     (msg.message_id, message.chat.id, accuser.id, target.id, accusation_text, end_time))
+        conn.commit()
+    
+    add_analytics("accuse")
+    asyncio.create_task(finish_accusation(message.chat.id, msg.message_id, 60))
+
+async def finish_accusation(chat_id, msg_id, delay):
+    await asyncio.sleep(delay)
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT text, votes_yes, votes_no FROM accusations WHERE msg_id = ?", (msg_id,))
+        res = cursor.fetchone()
+        
+        if res:
+            text, yes, no = res
+            result = "Это **ПРАВДА**! 🟢" if yes > no else "Это **НЕПРАВДА** (клевета)! 🔴" if no > yes else "Голоса разделились, объявляется **НИЧЬЯ**! 🟡"
+            
+            final_text = (f"⚖️ **СУД ОКОНЧЕН!**\n\n{text}\n\n"
+                          f"Итог голосования:\nЗа (Правда): {yes} голосов\nПротив (Ложь): {no} голосов\n\n"
+                          f"Вердикт: {result}")
+            
+            try:
+                await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=final_text, parse_mode=ParseMode.MARKDOWN)
+            except:
+                pass
+            
+            conn.execute("DELETE FROM accusations WHERE msg_id = ?", (msg_id,))
+            conn.commit()
+
+@dp.callback_query(F.data.startswith("vote_"))
+async def process_vote(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    action, user_id = parts[1], parts[2]
+    
+    if callback.from_user.id == int(user_id):
+        await callback.answer("Нельзя голосовать за себя, нажми на кнопку обвиняемого!", show_alert=True)
+        return
+
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT votes_yes, votes_no FROM accusations WHERE msg_id = ?", (callback.message.message_id,))
+        res = cursor.fetchone()
+        
+        if not res:
+            await callback.answer("Голосование уже завершено!", show_alert=True)
+            return
+
+        yes, no = res
+        if action == "yes":
+            yes += 1
+        else:
+            no += 1
+            
+        cursor.execute("UPDATE accusations SET votes_yes = ?, votes_no = ? WHERE msg_id = ?", (yes, no, callback.message.message_id))
+        conn.commit()
+
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text=f"✅ Да ({yes})", callback_data=f"vote_yes_{user_id}"),
+        InlineKeyboardButton(text=f"❌ Нет ({no})", callback_data=f"vote_no_{user_id}")
+    )
+    
+    try:
+        await callback.message.edit_reply_markup(reply_markup=builder.as_markup())
+    except:
+        pass
+    await callback.answer("Голос учтен!")
+
+
+# --- АДМИН ПАНЕЛЬ ---
+
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="📊 Статистика (Текст)", callback_data="admin_stats"))
+    builder.row(InlineKeyboardButton(text="📈 График прироста", callback_data="admin_graph"))
+    
+    await message.answer("👑 **Админ-панель**\nВыберите действие:", reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM chats")
+        total_chats = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM users")
+        total_users = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM analytics WHERE action_type='daily'")
+        total_daily = cursor.fetchone()[0]
+        
+        today = datetime.now().strftime("%Y-%m-%d")
+        cursor.execute("SELECT COUNT(*) FROM analytics WHERE date=?", (today,))
+        today_actions = cursor.fetchone()[0]
+
+    text = (f"📊 **Общая статистика бота:**\n\n"
+            f"👥 Всего пользователей: {total_users}\n"
+            f"💬 Всего чатов: {total_chats}\n"
+            f"💰 Выдано дейликов: {total_daily}\n"
+            f"⚡️ Действий за сегодня: {today_actions}")
+    
+    await callback.message.answer(text)
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_graph")
+async def admin_graph(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT date, COUNT(*) FROM analytics GROUP BY date ORDER BY date DESC LIMIT 7")
+        data = cursor.fetchall()[::-1]
+
+    if not data:
+        await callback.message.answer("Пока нет данных для графика.")
+        return
+
+    text = "📈 **График активности (последние дни):**\n```\n"
+    max_val = max([row[1] for row in data]) if data else 1
+    
+    for date, count in data:
+        bar = "█" * int((count / max_val) * 10)
+        text += f"{date} | {bar} ({count})\n"
+    text += "```"
+    
+    await callback.message.answer(text, parse_mode=ParseMode.MARKDOWN)
+    await callback.answer()
+
+@dp.message(Command("rass"))
+async def cmd_rass(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    if not message.reply_to_message:
+        await message.reply("Ответьте на сообщение, которое хотите разослать, командой /rass")
+        return
+
+    broadcast_text = message.reply_to_message.text or message.reply_to_message.caption
+    if not broadcast_text:
+        await message.reply("В сообщении нет текста.")
+        return
+
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT chat_id FROM chats")
+        chats = cursor.fetchall()
+
+    success = 0
+    fail = 0
+    msg = await message.reply(f"Начинаю рассылку на {len(chats)} чатов...")
+    
+    for (chat_id,) in chats:
+        try:
+            await bot.send_message(chat_id, f"📢 **РАССЫЛКА ОТ АДМИНА:**\n\n{broadcast_text}", parse_mode=ParseMode.MARKDOWN)
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            fail += 1
+            
+    await msg.edit_text(f"✅ Рассылка завершена.\nУспешно: {success}\nОшибок (бот заблокирован): {fail}")
+
+
+async def main():
+    print("Бот запущен!")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
